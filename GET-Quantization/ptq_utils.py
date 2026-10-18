@@ -5,6 +5,7 @@ import time
 import copy
 import yaml
 import pickle
+from GET.networks.embedding_translation import MainPipeline
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,3 +80,75 @@ def get_layer_group(model_tag: str, name: str) -> str:
         if name in ("s1", "s2", "s3"):
             return "mapper_skip_s"
         return "mapper_other"
+
+
+# ------------------------------------------------------------------------------
+# Model loader & Calibration DataLoader
+# ------------------------------------------------------------------------------
+
+def load_models(root_dir: str, config_rel_path: str = "GET/configs/bus_valid.yaml", device: str = "cpu"):
+    """Loads MainPipeline (mapper), AutoencoderKL (vae), scale_factor, and resolved config."""
+    get_dir = os.path.join(root_dir, "GET")
+    if get_dir not in sys.path:
+        sys.path.inser(0, get_dir)
+    
+    from ..GET.networks.embedding_translation import MainPipeline 
+    from ..GET.networks.vae_setup.autoencoder import AutoencoderKL
+    from ..GET.utils.tools import load_checkpoint
+
+    cfg_path = os.path.join(root_dir, config_rel_path)
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f) or {} 
+    
+    # Resolve paths relative to GET/
+    model_weight = os.path.join(get_dir, cfg["model_weight"].lstrip("./"))
+    vae_cfg_path = os.path.join(get_dir, cfg["vae_config_path"].lstrip("./"))
+    vae_ckpt     = os.path.join(get_dir, cfg["vae_ckpt"].lstrip("./"))
+    pkl_path     = os.path.join(get_dir, cfg["pickle_file_path"].lstrip("./"))
+
+    mapper = MainPipeline(
+        in_channel=cfg["in_channel"],
+        out_channels=cfg["out_channels"],
+        ch=cfg["ch"],
+        ch_mult=tuple(cfg["ch_mult"]),
+    )
+    mapper = load_checkpoint(mapper, model_weight)
+    mapper.to(device).eval().requires_grad_(False)
+
+    vae_cfg = OmegaConf.load(vae_cfg_path)
+    vae = AutoencoderKL(**vae_cfg.first_stage_config.params)
+    vae.load_state_dict(torch.load(vae_ckpt, map_location="cpu")["state_dict"], strict=True)
+    vae.to(device).eval().requires_grad_(False)
+
+    scale = float(vae_cfg.first_stage_config.scale_factor)
+    cfg["resolved_pickle_path"] = pkl_path
+    return vae, mapper, scale, cfg
+
+
+def get_dataloaders(pkl_path: str, n_calib: int = 64, n_eval: int = None, seed: int = 2333):
+    """
+    Runs a sample set of images to determine the intermediate activation outputs to
+    determine the proper range of the outputs, Scale, and Zero
+
+    Returns (calib_reader, test_loader)
+    calib_loader uses the 'train' split names but forces deterministic 'test' transforms.
+    """
+    from ..GET.utils.image_dataset import Image_Dataset
+
+    # Calibration dataset: load 'train' split, override transform with deterministic resize
+    calib_ds = Image_Dataset(pkl_path, stage="train")
+    calib_ds.stage = "test"
+    calib_ds.transform = calib_ds.get_transforms()
+
+    rng = np.random.default_rng(seed)
+    calib_indices = rng.choice(len(calib_ds), size=min(n_calib, len(calib_ds)), replace=False)
+    calib_subset = Subset(calib_ds, calib_indices)
+    calib_loader = DataLoader(calib_subset, batch_size=1, shuffle=False)
+
+    # Evaluation dataset: 'test' split
+    test_ds = Image_Dataset(pkl_path, stage="test")
+    if n_eval is not None and n_eval < len(test_ds):
+        test_ds = Subset(test_ds, list(range(n_eval)))
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=1)
+
+    return calib_loader, test_loader
