@@ -6,6 +6,7 @@ import copy
 import yaml
 import pickle
 from GET.networks.embedding_translation import MainPipeline
+from GET.valid import hd95
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -152,3 +153,106 @@ def get_dataloaders(pkl_path: str, n_calib: int = 64, n_eval: int = None, seed: 
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=1)
 
     return calib_loader, test_loader
+
+
+# ------------------------------------------------------------------------------
+# Evaluation (DSc, IoU, HD95, Latency, Size)
+# ------------------------------------------------------------------------------
+
+# DSc = Measure overlap area relative to the average size of both shapes (1: Perfect overlap, 0: No overlap)
+# IoU  (Intersection over Union) = Measure overlap area relative to the total combined area of both shapes (1: Perfect overlap, 0: No overlap)
+# HD95 = Measure boundary distance error between the predicted surface and true surface (0: Perfect match, >0: Higher error)
+
+def compute_hd95(pred: np.ndarray, gt: np.ndarray) -> float:
+    pred = pred.astype(bool)
+    gt = gt.astype(bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    # check if either mask is empty
+    if (pred.sum() == 0) ^ (gt.sum() == 0):
+        h, w = gt.shape
+        return float(np.hypot(h, w))
+    return float(medpy_hd95(pred, gt)) if medpy_hd95 is not None else float("nan")
+
+
+@torch.no_grad()
+def forward_pipeline(vae, mapper, img: torch.Tensor, scale: float) -> torch.Tensor:
+    """Runs the 3-step GET inference path: encode -> latent mapper -> decode"""
+    post = vae.encode(img) # turn image into an embedding
+    mu, _ = post.mu_and_sigma()
+    mu = scale * mu
+
+    mu_pred = mapper(mu)["out"]
+
+    z = (mu_pred / scale).clamp(-10, 10)
+    seg = vae.decode(z).mean(1, True).clamp(-1, 1)
+    seg = torch.nan_to_num(seg, nan=0.0, posinf=1.0, neginf=-1.0)
+    return ((seg + 1) * 0.5).clamp(0, 1)
+
+
+@torch.no_grad()
+def evaluate(vae, mapper, loader, scale: float, device: str = "cpu", warmup: int = 3) -> dict:
+    """Evaluates DSc, IoU, HD95, and average latency (ms/img)"""
+    dscs, ious, hd95s, times_ms = [], [], [], []
+    is_cuda = torch.device(device).type == "cuda"
+
+    for idx, batch in enumerate(loader):
+        img = (2 * batch["img"] - 1 ).to(device)
+        seg_raw = (batch["seg"]).permute(0,3,1,2 / 255.0).to(device)
+        seg_bin = seg_raw.mean(1, True)
+
+        if idx < warmup:
+            _ = forward_pipeline(vae, mapper, img, scale)
+        
+        if is_cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter() # start counter
+    
+        prob = forward_pipeline(vae, mapper, img, scale) # run pipeline
+
+        if is_cuda:
+            torch.cuda.synchronize()
+        times_ms.append((time.perf_counter() - t0) * 1000) # end counter
+
+        pred = (prob >= 0.5).cpu().numpy().astype(np.uint8).squeeze() # remove dimension of size 1
+        gt = (seg_bin >= 0.5).cpu().numpy().astype(np.uint8).squeeze()
+
+        tn, fp, fn, tp = confusion_matrix(gt.ravel(), pred.ravel(), labels=[0,1]).ravel()
+        denom_dsc = 2 * tp + fp + fn
+        denom_iou = tp + fp + fn
+
+        dscs.append(2 * tp / denom_dsc if denom_dsc else 0.0)
+        ious.append(tp / denom_iou if denom_iou else 0.0)
+        hd95s.append(compute_hd95(pred, gt))
+
+        return {
+            "DSC": float(np.mean(dscs)),
+            "IoU": float(np.mean(ious)),
+            "HD95": float(np.nanmean(hd95s)),
+            "ms_per_img": float(np.mean(times_ms)),
+        }
+
+
+def get_state_dict_size_mb(model: nn.Module) -> float:
+    """Measures serialized state_dict size in decimal MB (works for both FP32 and real INT8)."""
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    return buf.tell() / 1e6
+
+
+def estimate_int8_size_mb(model: nn.Module, skip_set=SKIP) -> float:
+    """Theoretical weight footprint (decimal MB) when target Conv2d weights are stored as INT8."""
+    total_bytes = 0
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            if is_target(name, m, skip_set):
+                # 1 byte per weight (INT8) + FP32 per-channel scale + optional FP32 bias
+                total_bytes += m.weight.numel() * 1 + m.out_channels * 4
+            else:
+                total_bytes += m.weight.numel() * 4
+            if m.bias is not None:
+                total_bytes += m.bias.numel() * 4
+        elif isinstance(m, (nn.GroupNorm, nn.Linear)):
+            for p in m.parameters(recurse=False):
+                total_bytes += p.num_el() * 4
+    return total_bytes / 1e6
