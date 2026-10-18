@@ -4,17 +4,12 @@ import io
 import time
 import copy
 import yaml
-import pickle
-from GET.networks.embedding_translation import MainPipeline
-from GET.valid import hd95
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.ao.quantization import QuantStub, DeQuantStub, QConfig, HistogramObserver, PerChannelMinMaxObserver, MinMaxObserver
 import numpy as np
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 from sklearn.metrics import confusion_matrix
 from omegaconf import OmegaConf
 
@@ -91,11 +86,11 @@ def load_models(root_dir: str, config_rel_path: str = "GET/configs/bus_valid.yam
     """Loads MainPipeline (mapper), AutoencoderKL (vae), scale_factor, and resolved config."""
     get_dir = os.path.join(root_dir, "GET")
     if get_dir not in sys.path:
-        sys.path.inser(0, get_dir)
+        sys.path.insert(0, get_dir)
     
-    from ..GET.networks.embedding_translation import MainPipeline 
-    from ..GET.networks.vae_setup.autoencoder import AutoencoderKL
-    from ..GET.utils.tools import load_checkpoint
+    from networks.embedding_translation import MainPipeline 
+    from networks.vae_setup.autoencoder import AutoencoderKL
+    from utils.tools import load_checkpoint
 
     cfg_path = os.path.join(root_dir, config_rel_path)
     with open(cfg_path, "r") as f:
@@ -131,10 +126,11 @@ def get_dataloaders(pkl_path: str, n_calib: int = 64, n_eval: int = None, seed: 
     Runs a sample set of images to determine the intermediate activation outputs to
     determine the proper range of the outputs, Scale, and Zero
 
-    Returns (calib_reader, test_loader)
+    Returns (calib_loader, test_loader)
     calib_loader uses the 'train' split names but forces deterministic 'test' transforms.
+    (Call load_models first: it puts the GET/ folder on sys.path so this import works.)
     """
-    from ..GET.utils.image_dataset import Image_Dataset
+    from utils.image_dataset import Image_Dataset
 
     # Calibration dataset: load 'train' split, override transform with deterministic resize
     calib_ds = Image_Dataset(pkl_path, stage="train")
@@ -150,7 +146,7 @@ def get_dataloaders(pkl_path: str, n_calib: int = 64, n_eval: int = None, seed: 
     test_ds = Image_Dataset(pkl_path, stage="test")
     if n_eval is not None and n_eval < len(test_ds):
         test_ds = Subset(test_ds, list(range(n_eval)))
-    test_loader = DataLoader(test_ds, batch_size=1, shuffle=1)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
     return calib_loader, test_loader
 
@@ -198,7 +194,8 @@ def evaluate(vae, mapper, loader, scale: float, device: str = "cpu", warmup: int
 
     for idx, batch in enumerate(loader):
         img = (2 * batch["img"] - 1 ).to(device)
-        seg_raw = (batch["seg"]).permute(0,3,1,2 / 255.0).to(device)
+        # mask arrives as [B,H,W,3] -> [B,3,H,W], scaled to [0,1] (same as GET/valid.py)
+        seg_raw = (batch["seg"].permute(0, 3, 1, 2) / 255.0).to(device)
         seg_bin = seg_raw.mean(1, True)
 
         if idx < warmup:
@@ -225,12 +222,12 @@ def evaluate(vae, mapper, loader, scale: float, device: str = "cpu", warmup: int
         ious.append(tp / denom_iou if denom_iou else 0.0)
         hd95s.append(compute_hd95(pred, gt))
 
-        return {
-            "DSC": float(np.mean(dscs)),
-            "IoU": float(np.mean(ious)),
-            "HD95": float(np.nanmean(hd95s)),
-            "ms_per_img": float(np.mean(times_ms)),
-        }
+    return {
+        "DSC": float(np.mean(dscs)),
+        "IoU": float(np.mean(ious)),
+        "HD95": float(np.nanmean(hd95s)),
+        "ms_per_img": float(np.mean(times_ms)),
+    }
 
 
 def get_state_dict_size_mb(model: nn.Module) -> float:
@@ -254,5 +251,5 @@ def estimate_int8_size_mb(model: nn.Module, skip_set=SKIP) -> float:
                 total_bytes += m.bias.numel() * 4
         elif isinstance(m, (nn.GroupNorm, nn.Linear)):
             for p in m.parameters(recurse=False):
-                total_bytes += p.num_el() * 4
+                total_bytes += p.numel() * 4
     return total_bytes / 1e6
