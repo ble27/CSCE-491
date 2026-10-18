@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from torch.ao.quantization import QuantStub, DeQuantStub, QConfig, HistogramObserver, PerChannelMinMaxObserver, MinMaxObserver
 import numpy as np
 from sklearn.metrics import confusion_matrix
 from omegaconf import OmegaConf
@@ -187,10 +186,16 @@ def forward_pipeline(vae, mapper, img: torch.Tensor, scale: float) -> torch.Tens
 
 
 @torch.no_grad()
-def evaluate(vae, mapper, loader, scale: float, device: str = "cpu", warmup: int = 3) -> dict:
-    """Evaluates DSc, IoU, HD95, and average latency (ms/img)"""
+def evaluate(vae, mapper, loader, scale: float, device: str = "cpu", warmup: int = 3,
+             forward_fn=None) -> dict:
+    """
+    Evaluates DSc, IoU, HD95, and average latency (ms/img).
+    forward_fn: optional fn(img) -> probability map, used instead of the PyTorch pipeline
+                (Stage C passes the TensorRT pipeline here; vae/mapper are then ignored).
+    """
     dscs, ious, hd95s, times_ms = [], [], [], []
     is_cuda = torch.device(device).type == "cuda"
+    run = forward_fn if forward_fn is not None else (lambda im: forward_pipeline(vae, mapper, im, scale))
 
     for idx, batch in enumerate(loader):
         img = (2 * batch["img"] - 1 ).to(device)
@@ -199,13 +204,13 @@ def evaluate(vae, mapper, loader, scale: float, device: str = "cpu", warmup: int
         seg_bin = seg_raw.mean(1, True)
 
         if idx < warmup:
-            _ = forward_pipeline(vae, mapper, img, scale)
+            _ = run(img)
         
         if is_cuda:
             torch.cuda.synchronize()
         t0 = time.perf_counter() # start counter
     
-        prob = forward_pipeline(vae, mapper, img, scale) # run pipeline
+        prob = run(img) # run pipeline
 
         if is_cuda:
             torch.cuda.synchronize()
