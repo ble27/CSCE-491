@@ -164,6 +164,9 @@ def build_engine(onnx_path, plan_path, int8=False, fp16=True, workspace_gb=2):
     """
     import tensorrt as trt
 
+    if not hasattr(trt.BuilderFlag, "FP16"):
+        raise RuntimeError(f"TensorRT {trt.__version__} removed BuilderFlag.FP16/INT8 (strongly-typed only). "
+                           "Run `%pip install -q 'tensorrt<11'` and restart the runtime.")
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
     network = builder.create_network()                      # TRT >= 10: explicit batch is the default
